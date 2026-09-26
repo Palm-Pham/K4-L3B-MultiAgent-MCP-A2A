@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+import httpx2
+
 from .mcp_gateway import EvidenceGateway
 from .trace import TraceWriter
+
+logger = logging.getLogger(__name__)
 
 OWNERS = {
     "get_order": "entity-agent",
@@ -83,7 +88,8 @@ class EvidenceClient:
                 ):
                     raise ValueError("MCP response has no evidence_ref")
                 self.cache[key] = response
-                self.state.evidence[tool] = response
+                if tool != "get_order":
+                    self.state.evidence[tool] = response
                 ref = response["evidence_ref"]
                 if ref not in self.state.all_refs:
                     self.state.all_refs.append(ref)
@@ -92,12 +98,20 @@ class EvidenceClient:
                     actor=actor, tool_name=tool, evidence_refs=[ref],
                 )
                 return response
-            except (TimeoutError, ConnectionError) as exc:
+            except (TimeoutError, ConnectionError, httpx2.TransportError) as exc:
                 if attempt == 0:
                     continue
-                self.state.errors.append(f"{tool}: {type(exc).__name__}")
-            except (RuntimeError, ValueError, TypeError) as exc:
-                self.state.errors.append(f"{tool}: {type(exc).__name__}")
+                self.state.errors.append(f"{tool}: {type(exc).__name__}: {exc}")
+                logger.warning("%s: %s", self.state.case_id, self.state.errors[-1])
+            except RuntimeError as exc:
+                if attempt == 0 and "Error executing tool" in str(exc):
+                    continue
+                self.state.errors.append(f"{tool}: {type(exc).__name__}: {exc}")
+                logger.warning("%s: %s", self.state.case_id, self.state.errors[-1])
+                break
+            except (ValueError, TypeError) as exc:
+                self.state.errors.append(f"{tool}: {type(exc).__name__}: {exc}")
+                logger.warning("%s: %s", self.state.case_id, self.state.errors[-1])
                 break
         return None
 
@@ -161,12 +175,59 @@ def _is_after(left: Any, right: Any) -> bool | None:
 
 
 def _payment_rows(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, list):
+        return [row for row in data if isinstance(row, dict)]
     for row in _maps(data):
         for key in ("payments", "payment_rows"):
             value = row.get(key)
             if isinstance(value, list):
                 return [item for item in value if isinstance(item, dict)]
     return []
+
+
+def _event_total(data: Any, event_types: set[str]) -> Decimal | None:
+    """Count confirmed events only; unavailable timelines are not zero refunds."""
+    if not isinstance(data, dict) or not isinstance(data.get("events"), list):
+        return None
+    total = Decimal(0)
+    seen: dict[str, dict[str, Any]] = {}
+    for event in data["events"]:
+        if not isinstance(event, dict):
+            return None
+        if event.get("event_type") not in event_types:
+            continue
+        if event.get("status") not in {"confirmed", "completed", "succeeded"}:
+            return None
+        event_id = event.get("event_id")
+        if isinstance(event_id, str):
+            if event_id in seen:
+                if seen[event_id] != event:
+                    return None
+                continue
+            seen[event_id] = event
+        amount = _money(event.get("amount_brl"))
+        if amount is None:
+            return None
+        total += amount
+    return total
+
+
+def _policy_rule(state: CaseState, issue: str) -> dict[str, Any] | None:
+    data = state.data("get_policy")
+    if not isinstance(data, dict) or data.get("currency") != "BRL":
+        return None
+    if data.get("policy_version") != state.case.get("policy_version"):
+        return None
+    rules = data.get("rules")
+    rule = rules.get(issue) if isinstance(rules, dict) else None
+    if not isinstance(rule, dict) or _money(rule.get("refund_brl")) is None:
+        return None
+    if rule.get("case_status") not in {"action_required", "no_action", "needs_investigation"}:
+        return None
+    action = rule.get("recommended_action")
+    if not isinstance(action, str) or not 1 <= len(action) <= 80:
+        return None
+    return rule
 
 
 async def _resolve(state: CaseState, client: EvidenceClient) -> None:
@@ -186,7 +247,9 @@ async def _resolve(state: CaseState, client: EvidenceClient) -> None:
             continue
         customer = _field(data, "customer_unique_id")
         customer = customer if isinstance(customer, str) and customer else None
-        corroborated = candidate in history_ids or customer == state.customer_hint
+        corroborated = candidate in history_ids or (
+            state.customer_hint is not None and customer == state.customer_hint
+        )
         if state.customer_hint and not corroborated:
             if customer and candidate not in state.rejected:
                 state.rejected.append(candidate)
@@ -196,6 +259,9 @@ async def _resolve(state: CaseState, client: EvidenceClient) -> None:
             break
     if len(matches) == 1:
         state.order_id, order_customer = matches[0]
+        state.evidence["get_order"] = client.cache[
+            ("get_order", (("order_id", state.order_id),))
+        ]
         state.customer_id = order_customer or (
             state.customer_hint if state.order_id in history_ids else None
         )
@@ -231,27 +297,48 @@ def _shipment(state: CaseState) -> tuple[str, list[str], bool]:
     data = state.data("get_shipment_summary")
     if data is None:
         return "insufficient_evidence", [], False
+    if any(c["field"].startswith(("shipment", "order_items", "order_history"))
+           for c in _conflicts(state)):
+        return "conflicting", [], False
     status = str(_field(data, "shipment_status", "status") or "").lower()
     if status in {"lost", "returned"}:
         return status, [], True
     delivered_late = _is_after(
-        _field(data, "order_delivered_customer_date", "delivered_at"),
+        _field(data, "order_delivered_customer_date", "delivered_at", "delivered_customer_at"),
         _field(data, "order_estimated_delivery_date", "estimated_delivery_at"),
     )
-    seller_late = _is_after(
-        _field(data, "order_delivered_carrier_date", "carrier_handoff_at"),
-        _field(data, "shipping_limit_date")
-        or _field(state.data("get_order_items"), "shipping_limit_date"),
-    )
-    if seller_late:
-        return (
-            "seller_delay", _ids(state.data("get_order_items"), "seller_id"),
-            delivered_late is not None,
-        )
-    if delivered_late is True:
+    # Compare each seller's own handoff with that seller's deadline.
+    items = [row for row in _maps(state.data("get_order_items"))
+             if isinstance(row.get("seller_id"), str)]
+    sellers = set(_ids(items, "seller_id"))
+    shipment_rows = [row for row in _maps(data) if "seller_id" in row
+                     and any(k in row for k in ("carrier_handoff_at",
+                                                "delivered_carrier_at",
+                                                "order_delivered_carrier_date"))]
+    checks: list[tuple[str, bool | None]] = []
+    for item in items:
+        seller = item["seller_id"]
+        rows = [row for row in shipment_rows if row.get("seller_id") == seller]
+        # An order-wide handoff is usable only for a single-seller order.
+        if not rows and len(sellers) == 1:
+            rows = [data]
+        if not rows:
+            checks.append((seller, None))
+        for row in rows:
+            checks.append((seller, _is_after(
+                _field(row, "carrier_handoff_at", "order_delivered_carrier_date",
+                       "delivered_carrier_at"),
+                item.get("shipping_limit_date") or row.get("shipping_limit_date"),
+            )))
+    late_sellers = sorted({seller for seller, late in checks if late is True})
+    complete = bool(checks) and all(late is not None for _, late in checks)
+    complete = complete and delivered_late is not None
+    if late_sellers:
+        return "seller_delay", late_sellers, complete
+    if delivered_late is True and complete:
         return "logistics_delay", [], True
     if delivered_late is False:
-        return "on_time", [], True
+        return "on_time", [], complete
     return "insufficient_evidence", [], False
 
 
@@ -263,26 +350,35 @@ def _payment(state: CaseState) -> tuple[str, Decimal | None, Decimal | None, Dec
     )
     captured = _money(_field(timeline, "captured_total_brl", "captured_total"))
     if captured is None:
+        captured = _event_total(timeline, {"captured"})
+    if captured is None:
         captured = _money(_field(base, "captured_total_brl", "captured_total"))
     refunded = _money(_field(refunds, "refunded_total_brl", "refunded_total"))
-    remaining = max(Decimal(0), captured - refunded) if (
+    if refunded is None:
+        refunded = _event_total(refunds, {"refunded", "refund_completed"})
+    if captured is not None and refunded is not None and refunded > captured:
+        return "capture_mismatch", captured, refunded, None
+    remaining = captured - refunded if (
         captured is not None and refunded is not None
     ) else None
-    status = str(_field(refunds, "refund_status", "status") or "").lower()
-    if status in {"failed", "failure"}:
+    status = str(refunds.get("refund_status", refunds.get("status", ""))).lower() \
+        if isinstance(refunds, dict) else ""
+    if _field(timeline, "duplicate_capture") is True:
+        verdict = "duplicate_capture"
+    elif _field(timeline, "capture_mismatch") is True:
+        verdict = "capture_mismatch"
+    elif status in {"failed", "failure"}:
         verdict = "refund_failed"
     elif status in {"pending", "processing", "initiated"}:
         verdict = "refund_pending"
     elif status in {"refunded", "completed", "succeeded"}:
         verdict = "refunded"
-    elif _field(timeline, "duplicate_capture") is True:
-        verdict = "duplicate_capture"
-    elif _field(timeline, "capture_mismatch") is True:
-        verdict = "capture_mismatch"
     elif captured is not None and refunded is not None:
-        verdict = "reconciled"
+        verdict = "refunded" if captured > 0 and refunded == captured else "reconciled"
     else:
         verdict = "insufficient_evidence"
+    if any(c["field"].startswith(("payment", "captured")) for c in _conflicts(state)):
+        return "insufficient_evidence", captured, refunded, None
     return verdict, captured, refunded, remaining
 
 
@@ -296,7 +392,7 @@ def _conflicts(state: CaseState) -> list[dict[str, Any]]:
     ):
         conflicts.append({
             "field": "order_status", "sources": ["get_order", "get_shipment_summary"],
-            "selected_source": "get_order", "resolution_code": "authoritative_order",
+            "selected_source": None, "resolution_code": "unresolved_source_conflict",
         })
     base_capture = _money(_field(
         state.data("get_order_payments"), "captured_total_brl", "captured_total"
@@ -310,10 +406,42 @@ def _conflicts(state: CaseState) -> list[dict[str, Any]]:
         conflicts.append({
             "field": "captured_total_brl",
             "sources": ["get_order_payments", "get_payment_timeline"],
-            "selected_source": "get_payment_timeline",
-            "resolution_code": "authoritative_payment_timeline",
+            "selected_source": None,
+            "resolution_code": "unresolved_source_conflict",
         })
-    return conflicts
+    def conflict(field: str, sources: list[str]) -> None:
+        conflicts.append({"field": field, "sources": sources,
+                          "selected_source": None, "resolution_code": "unresolved_source_conflict"})
+
+    groups = [
+        ("order_history", "get_customer_history", "order_id"),
+        ("order_items", "get_order_items", "order_item_id"),
+        ("payment_rows", "get_order_payments", "payment_sequential"),
+    ]
+    for field_name, tool, key in groups:
+        seen: dict[str, tuple[int, dict[str, Any]]] = {}
+        for index, row in enumerate(_maps(state.data(tool))):
+            identifier = row.get(key)
+            if identifier is None or (
+                state.order_id and row.get("order_id") not in {None, state.order_id}
+            ):
+                continue
+            identifier = str(identifier)
+            if identifier in seen and seen[identifier][1] != row:
+                conflict(field_name, [f"{tool}[{seen[identifier][0]}]", f"{tool}[{index}]"])
+                break
+            seen[identifier] = (index, row)
+    shipment = state.data("get_shipment_summary")
+    if isinstance(shipment, dict):
+        late = _is_after(_field(shipment, "delivered_customer_at", "delivered_at",
+                                "order_delivered_customer_date"),
+                         _field(shipment, "estimated_delivery_at", "order_estimated_delivery_date"))
+        if late is False and any(row.get("event_type") == "delivered_late"
+                                 and row.get("status") == "confirmed"
+                                 for row in _maps(shipment.get("events"))):
+            conflict("shipment_delivery", ["get_shipment_summary.summary",
+                                           "get_shipment_summary.events"])
+    return conflicts[:5]
 
 
 def _claim(
@@ -322,7 +450,7 @@ def _claim(
 ) -> tuple[str, list[str]]:
     if topic in {"late_delivery_seller", "late_delivery_logistics"}:
         expected = "seller_delay" if topic.endswith("seller") else "logistics_delay"
-        if shipment == "insufficient_evidence":
+        if shipment in {"insufficient_evidence", "conflicting"}:
             return "insufficient_evidence", ["get_shipment_summary", "get_order_items"]
         return ("supported" if shipment == expected else "unsupported",
                 ["get_shipment_summary", "get_order_items"])
@@ -357,15 +485,21 @@ def _claim(
         return ("supported" if supported else "insufficient_evidence",
                 ["get_order_payments", "get_payment_timeline"])
     if topic == "requested_full_refund":
-        if not order_status or remaining is None or state.data("get_policy") is None:
-            return "insufficient_evidence", [
-                "get_order", "get_refund_timeline", "get_policy"
-            ]
-        eligible = order_status in {"canceled", "unavailable"} and (
-            remaining is not None and remaining > 0
+        tools = ["get_order", "get_payment_timeline", "get_refund_timeline", "get_policy"]
+        if remaining == 0:
+            return "unsupported", tools
+        if remaining is None or _conflicts(state):
+            return "insufficient_evidence", tools
+        issue = {"canceled": "canceled_order_paid", "unavailable": "unavailable_order_paid"}.get(
+            order_status
         )
-        return ("supported" if eligible else "unsupported",
-                ["get_order", "get_refund_timeline", "get_policy"])
+        if issue is None:
+            return "insufficient_evidence", tools
+        rule = _policy_rule(state, issue)
+        if rule is None:
+            return "insufficient_evidence", tools
+        approved = _money(rule["refund_brl"])
+        return ("supported" if approved == remaining else "unsupported"), tools
     if topic == "unsupported_claim":
         clear = (
             order_status == "delivered" and shipment == "on_time"
@@ -387,7 +521,7 @@ def _build(state: CaseState) -> dict[str, Any]:
             state, item["topic"], order_status, shipment, payment, captured, refundable
         )
         refs = state.refs(*tools) if tools else []
-        if not resolved or not refs or (
+        if _conflicts(state) or not resolved or not refs or (
             item["topic"].startswith("late_delivery") and not timeline_complete
         ):
             verdict = "insufficient_evidence"
@@ -407,11 +541,20 @@ def _build(state: CaseState) -> dict[str, Any]:
     status = ("needs_investigation" if primary == "insufficient_evidence" else
               "no_action" if primary in {"unsupported_claim", "valid_split_payment"} else
               "action_required")
+    conflicts = _conflicts(state)
     refund = Decimal(0)
-    if primary in {"canceled_order_paid", "unavailable_order_paid", "refund_failed"} and (
-        refundable is not None and state.data("get_policy") is not None
-    ):
-        refund = refundable
+    rule = _policy_rule(state, primary)
+    action = "investigate_missing_evidence"
+    if rule is not None and not conflicts:
+        proposed = _money(rule["refund_brl"])
+        if proposed == 0 or (refundable is not None and proposed <= refundable):
+            refund = proposed
+            status = rule["case_status"]
+            action = rule["recommended_action"]
+        else:
+            status = "needs_investigation"
+    else:
+        status = "needs_investigation"
     causes = [] if primary in {"insufficient_evidence", "unsupported_claim"} else [
         {"cause_code": primary.upper(), "rank": 1}
     ]
@@ -424,6 +567,17 @@ def _build(state: CaseState) -> dict[str, Any]:
     parties = [{"party_type": party, "party_id": (
         late_sellers[0] if party == "seller" and late_sellers else None
     )}] if causes else []
+    if rule is not None and not conflicts:
+        policy_parties = rule.get("responsible_parties")
+        if isinstance(policy_parties, list) and len(policy_parties) <= 5 and all(
+            isinstance(p, dict) and set(p) == {"party_type", "party_id"}
+            and p["party_type"] in {"seller", "platform", "logistics_provider",
+                                    "payment_provider", "customer", "unknown"}
+            and (p["party_id"] is None or
+                 isinstance(p["party_id"], str) and len(p["party_id"]) <= 128)
+            for p in policy_parties
+        ):
+            parties = policy_parties
     return {
         "schema_version": "day09-l3b-output-v2", "case_id": state.case_id,
         "assessment": {
@@ -470,7 +624,7 @@ def _build(state: CaseState) -> dict[str, Any]:
             "refundable_total_brl": float(refundable) if refundable is not None else None,
         },
         "root_cause_analysis": {"ranked_causes": causes, "responsible_parties": parties},
-        "evidence_refs": state.refs(), "data_conflicts": _conflicts(state),
+        "evidence_refs": state.refs(), "data_conflicts": conflicts,
         "financial_resolution": {
             "currency": "BRL", "recommended_refund_brl": float(refund),
             "refund_lines": [{
@@ -478,13 +632,7 @@ def _build(state: CaseState) -> dict[str, Any]:
                 "entity_id": state.order_id,
             }] if refund > 0 else [],
         },
-        "resolution_actions": [
-            "investigate_missing_evidence" if status == "needs_investigation" else (
-                "issue_refund" if refund > 0 else (
-                    "review_case" if status == "action_required" else "no_action"
-                )
-            )
-        ],
+        "resolution_actions": [action],
     }
 
 
@@ -499,6 +647,19 @@ def _verify(state: CaseState, output: dict[str, Any], trace: TraceWriter) -> Non
     lines = output["financial_resolution"]["refund_lines"]
     if amount != sum((Decimal(str(line["amount_brl"])) for line in lines), Decimal(0)):
         raise ValueError("refund lines do not reconcile")
+    if state.order_id and _field(state.data("get_order"), "order_id") != state.order_id:
+        raise ValueError("selected order does not match order evidence")
+    payment = output["payment_analysis"]
+    captured, refunded = payment["captured_total_brl"], payment["refunded_total_brl"]
+    if (captured is not None and refunded is not None and refunded > captured
+            and (payment["verdict"] != "capture_mismatch" or amount > 0)):
+        raise ValueError("invalid payment reconciliation")
+    if amount > 0:
+        rule = _policy_rule(state, output["assessment"]["primary_issue"])
+        remaining = _payment(state)[3]
+        if (rule is None or amount != _money(rule["refund_brl"]) or remaining is None
+                or amount > remaining or _conflicts(state)):
+            raise ValueError("refund policy or available balance has not been verified")
     trace.contracts.validate_output(output, f"outputs/{state.case_id}.json")
 
 
@@ -528,6 +689,11 @@ async def solve_case(
     trace.emit(case_id=state.case_id, event_type="task_assigned",
                actor="coordinator", target="entity-agent")
     await _resolve(state, client)
+    if not state.all_refs and state.errors:
+        raise RuntimeError(
+            f"{state.case_id}: MCP returned no evidence; run stopped. "
+            + " | ".join(state.errors)
+        )
     trace.emit(case_id=state.case_id, event_type="handoff", actor="entity-agent",
                target="coordinator", decision_code="resolved" if state.order_id else "unresolved")
     if state.order_id:
